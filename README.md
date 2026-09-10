@@ -520,3 +520,7 @@ This project is a fork of [ace-tool-rs](https://github.com/missdeer/ace-tool-rs)
 - **Commercial / workplace use** — requires a commercial license from the upstream author, see [LICENSE-COMMERCIAL](LICENSE-COMMERCIAL) (contact missdeer@gmail.com)
 
 Modifications in this fork are Copyright (c) 2026 [linqiu919](https://github.com/linqiu919), released under the same terms.
+
+## 🔗 Friend Links
+
+- 🐧 [**LinuxDO**](https://linux.do) — A community for tech enthusiasts

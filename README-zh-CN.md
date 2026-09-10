@@ -520,3 +520,7 @@ cargo clippy
 - **商业 / 工作场景用途** —— 需向上游作者获取商业授权，见 [LICENSE-COMMERCIAL](LICENSE-COMMERCIAL)（联系 missdeer@gmail.com）
 
 本衍生项目的修改部分版权归 [linqiu919](https://github.com/linqiu919) 所有（2026），以相同条款发布。
+
+## 🔗 Friend Links
+
+- 🐧 [**LinuxDO**](https://linux.do) — A community for tech enthusiasts
