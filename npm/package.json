@@ -1,0 +1,43 @@
+{
+  "name": "bce-tool",
+  "version": "0.0.7",
+  "private": true,
+  "description": "MCP server for codebase indexing, semantic search, and prompt enhancement",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/linqiu919/bce-tool-rs.git"
+  },
+  "author": "missdeer",
+  "license": "GPL-3.0-only OR LicenseRef-Commercial",
+  "bugs": {
+    "url": "https://github.com/linqiu919/bce-tool-rs/issues"
+  },
+  "homepage": "https://github.com/linqiu919/bce-tool-rs#readme",
+  "keywords": [
+    "mcp",
+    "codebase",
+    "indexing",
+    "semantic-search",
+    "prompt-enhancement",
+    "rust",
+    "cli"
+  ],
+  "bin": {
+    "bce-tool": "run.js"
+  },
+  "files": [
+    "run.js"
+  ],
+  "engines": {
+    "node": ">=14.14.0"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ]
+}

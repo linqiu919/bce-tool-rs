@@ -1,0 +1,17 @@
+{
+  "name": "@bce-tool/linux-x64",
+  "version": "0.0.7",
+  "description": "Platform-specific binary for bce-tool (Linux x64)",
+  "license": "GPL-3.0-only OR LicenseRef-Commercial",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/linqiu919/bce-tool-rs.git"
+  },
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "files": ["bin/bce-tool"],
+  "preferUnplugged": true,
+  "publishConfig": {
+    "access": "public"
+  }
+}

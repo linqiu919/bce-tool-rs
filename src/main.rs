@@ -1,0 +1,288 @@
+//! bce-tool - MCP server for codebase indexing and semantic search
+
+use bce_tool::config::{Config, ConfigOptions};
+use bce_tool::enhancer::prompt_enhancer::{get_enhancer_endpoint, PromptEnhancer};
+use bce_tool::index::IndexManager;
+use bce_tool::mcp::{McpServer, TransportMode};
+use bce_tool::service::get_third_party_config;
+use anyhow::{anyhow, Result};
+use clap::{Parser, ValueEnum};
+use std::env;
+use tracing::{error, info, warn};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+#[derive(ValueEnum, Debug, Copy, Clone)]
+enum TransportArg {
+    Auto,
+    Lsp,
+    Line,
+}
+
+#[derive(Parser, Debug)]
+#[command(name = "bce-tool")]
+#[command(about = "MCP server for codebase indexing and semantic search")]
+struct Args {
+    /// API base URL for the indexing service
+    #[arg(long)]
+    base_url: Option<String>,
+
+    /// Authentication token
+    #[arg(long)]
+    token: Option<String>,
+
+    /// Transport framing: auto, lsp, line
+    #[arg(long, value_enum, default_value = "auto")]
+    transport: TransportArg,
+
+    /// Maximum lines per blob (default: 800)
+    #[arg(long)]
+    max_lines_per_blob: Option<usize>,
+
+    /// Upload timeout in seconds (default: adaptive)
+    #[arg(long)]
+    upload_timeout: Option<u64>,
+
+    /// Upload concurrency (default: adaptive)
+    #[arg(long)]
+    upload_concurrency: Option<usize>,
+
+    /// Retrieval timeout in seconds (default: 60)
+    #[arg(long)]
+    retrieval_timeout: Option<u64>,
+
+    /// Disable adaptive strategy
+    #[arg(long, default_value = "false")]
+    no_adaptive: bool,
+
+    /// Disable web browser interaction for enhance_prompt, return API result directly
+    #[arg(long, default_value = "false")]
+    no_webbrowser_enhance_prompt: bool,
+
+    /// Force using xdg-open instead of explorer.exe in WSL environment
+    /// Use this if WSL localhost forwarding is disabled and browser can't reach the WSL server
+    #[arg(long, default_value = "false")]
+    force_xdg_open: bool,
+
+    /// Allow indexing directories that are not inside a Git repository
+    /// By default, indexing/search/enhance refuse non-Git directories to avoid
+    /// accidentally indexing personal folders (e.g. Downloads)
+    #[arg(long, default_value = "false")]
+    allow_non_git: bool,
+
+    /// Bind address and port for the enhance_prompt Web UI server (e.g., "127.0.0.1:8754", "0.0.0.0:3456")
+    /// If not specified, automatically selects an available port on 127.0.0.1.
+    /// WARNING: Binding to 0.0.0.0 or a non-loopback address exposes the unauthenticated
+    /// Web UI to the network. Only use this in trusted environments.
+    #[arg(long)]
+    webui_addr: Option<String>,
+
+    /// Index-only mode: index current directory and exit (no MCP server)
+    #[arg(long, default_value = "false")]
+    index_only: bool,
+
+    /// One-shot search mode: index the current directory, run codebase
+    /// retrieval for the query, print the result to stdout, then exit
+    /// (no MCP server)
+    #[arg(long)]
+    search: Option<String>,
+
+    /// Enhance a prompt and output the result to stdout, then exit
+    #[arg(long)]
+    enhance_prompt: Option<String>,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Initialize tracing for stderr (MCP uses stdout for protocol)
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
+    let args = Args::parse();
+
+    // Enhance-prompt mode: enhance the prompt and output to stdout
+    if let Some(ref prompt) = args.enhance_prompt {
+        info!("Enhance-prompt mode: enhancing prompt");
+        let project_root = env::current_dir()?;
+        info!("Project root: {:?}", project_root);
+
+        // Check if using third-party endpoint (claude/openai/gemini)
+        let endpoint = get_enhancer_endpoint();
+        let config = if endpoint.is_third_party() {
+            // For third-party endpoints, base_url and token are not required from CLI
+            // They will be read from environment variables
+            // Validate early that required environment variables are set
+            let _ = get_third_party_config(endpoint)
+                .map_err(|e| anyhow!("Third-party endpoint configuration error: {}", e))?;
+            info!("Using third-party endpoint: {}", endpoint);
+            match (args.base_url.clone(), args.token.clone()) {
+                (Some(base_url), Some(token)) => {
+                    info!("Using CLI base_url/token to enable BCE search features");
+                    Config::new(
+                        base_url,
+                        token,
+                        ConfigOptions {
+                            max_lines_per_blob: args.max_lines_per_blob,
+                            upload_timeout: args.upload_timeout,
+                            upload_concurrency: args.upload_concurrency,
+                            retrieval_timeout: args.retrieval_timeout,
+                            no_adaptive: args.no_adaptive,
+                            no_webbrowser_enhance_prompt: args.no_webbrowser_enhance_prompt,
+                            force_xdg_open: args.force_xdg_open,
+                            allow_non_git: args.allow_non_git,
+                            webui_addr: args.webui_addr.clone(),
+                        },
+                    )?
+                }
+                (None, None) => Config::new_for_third_party_enhancer(),
+                _ => {
+                    return Err(anyhow!(
+                        "--base-url and --token must be provided together in third-party enhance-prompt mode"
+                    ));
+                }
+            }
+        } else {
+            // For new/old endpoints, base_url and token are required
+            let base_url = args
+                .base_url
+                .clone()
+                .ok_or_else(|| anyhow!("--base-url is required for '{}' endpoint", endpoint))?;
+            let token = args
+                .token
+                .clone()
+                .ok_or_else(|| anyhow!("--token is required for '{}' endpoint", endpoint))?;
+            Config::new(
+                base_url,
+                token,
+                ConfigOptions {
+                    max_lines_per_blob: args.max_lines_per_blob,
+                    upload_timeout: args.upload_timeout,
+                    upload_concurrency: args.upload_concurrency,
+                    retrieval_timeout: args.retrieval_timeout,
+                    no_adaptive: args.no_adaptive,
+                    no_webbrowser_enhance_prompt: args.no_webbrowser_enhance_prompt,
+                    force_xdg_open: args.force_xdg_open,
+                    allow_non_git: args.allow_non_git,
+                    webui_addr: args.webui_addr.clone(),
+                },
+            )?
+        };
+
+        let enhancer = PromptEnhancer::new(config.clone())?;
+        let enhanced = enhancer
+            .enhance_simple(prompt, "", Some(&project_root))
+            .await?;
+
+        // Output enhanced prompt to stdout
+        println!("{}", enhanced);
+        return Ok(());
+    }
+
+    // For non-enhance-prompt modes, base_url and token are always required
+    let base_url = args
+        .base_url
+        .ok_or_else(|| anyhow!("--base-url is required"))?;
+    let token = args.token.ok_or_else(|| anyhow!("--token is required"))?;
+
+    // Initialize configuration
+    let config = Config::new(
+        base_url,
+        token,
+        ConfigOptions {
+            max_lines_per_blob: args.max_lines_per_blob,
+            upload_timeout: args.upload_timeout,
+            upload_concurrency: args.upload_concurrency,
+            retrieval_timeout: args.retrieval_timeout,
+            no_adaptive: args.no_adaptive,
+            no_webbrowser_enhance_prompt: args.no_webbrowser_enhance_prompt,
+            force_xdg_open: args.force_xdg_open,
+            allow_non_git: args.allow_non_git,
+            webui_addr: args.webui_addr,
+        },
+    )?;
+
+    // Index-only mode: index current directory and exit
+    if args.index_only {
+        info!("Index-only mode: indexing current directory");
+        let project_root = env::current_dir()?;
+        info!("Project root: {:?}", project_root);
+
+        let manager = IndexManager::new(config, project_root)?;
+        let result = manager.index_project().await;
+
+        match result.status.as_str() {
+            "success" => {
+                info!("Indexing completed successfully: {}", result.message);
+                if let Some(stats) = result.stats {
+                    info!(
+                        "Stats: {} total blobs, {} existing, {} new",
+                        stats.total_blobs, stats.existing_blobs, stats.new_blobs
+                    );
+                }
+                return Ok(());
+            }
+            "partial" => {
+                warn!("Indexing completed with warnings: {}", result.message);
+                if let Some(stats) = result.stats {
+                    if let Some(failed_batches) = stats.failed_batches {
+                        warn!(
+                            "Stats: {} total blobs, {} existing, {} new, {} failed batches",
+                            stats.total_blobs,
+                            stats.existing_blobs,
+                            stats.new_blobs,
+                            failed_batches
+                        );
+                    } else {
+                        warn!(
+                            "Stats: {} total blobs, {} existing, {} new",
+                            stats.total_blobs, stats.existing_blobs, stats.new_blobs
+                        );
+                    }
+                }
+                std::process::exit(2);
+            }
+            _ => {
+                return Err(anyhow::anyhow!("Indexing failed: {}", result.message));
+            }
+        }
+    }
+
+    // One-shot search mode: index current directory, search, print result to stdout, then exit
+    if let Some(ref query) = args.search {
+        info!("Search mode: searching current directory");
+        let project_root = env::current_dir()?;
+        info!("Project root: {:?}", project_root);
+
+        let manager = IndexManager::new(config, project_root)?;
+        match manager.search_context(query).await {
+            Ok(result) => {
+                // Only the search result goes to stdout (logs go to stderr),
+                // so the output can be consumed directly by scripts / skills
+                println!("{}", result);
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("Search failed: {}", e));
+            }
+        }
+    }
+
+    info!("Starting bce-tool MCP server");
+
+    let transport_mode = match args.transport {
+        TransportArg::Auto => None,
+        TransportArg::Lsp => Some(TransportMode::Lsp),
+        TransportArg::Line => Some(TransportMode::Line),
+    };
+
+    // Create and run MCP server
+    let server = McpServer::new(config, transport_mode);
+
+    if let Err(e) = server.run().await {
+        error!("Server error: {}", e);
+        std::process::exit(1);
+    }
+
+    Ok(())
+}

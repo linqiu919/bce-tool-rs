@@ -1,0 +1,302 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: write
+  id-token: write # Required for NPM OIDC
+
+jobs:
+  build-release:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            artifact_name: bce-tool
+            asset_name: bce-tool_Linux_x86_64.tar.gz
+            universal: false
+            cross: false
+          # Linux aarch64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            artifact_name: bce-tool
+            asset_name: bce-tool_Linux_aarch64.tar.gz
+            universal: false
+            cross: true
+          # macOS universal (x86_64 + aarch64)
+          - target: universal-apple-darwin
+            os: macos-latest
+            artifact_name: bce-tool
+            asset_name: bce-tool_Darwin_universal.tar.gz
+            universal: true
+            cross: false
+          # Windows x86_64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact_name: bce-tool.exe
+            asset_name: bce-tool_Windows_x86_64.zip
+            universal: false
+            cross: false
+          # Windows aarch64
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            artifact_name: bce-tool.exe
+            asset_name: bce-tool_Windows_aarch64.zip
+            universal: false
+            cross: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust (Universal)
+        if: matrix.universal == true
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - name: Setup Rust (Single Target)
+        if: matrix.universal != true
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl-tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt update; sudo apt install musl-tools
+
+      - name: Install cross
+        if: matrix.cross == true
+        uses: taiki-e/install-action@cross
+
+      - name: Build (cross)
+        if: matrix.cross == true
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build
+        if: matrix.universal != true && matrix.cross != true
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build Universal Binary (macOS)
+        if: matrix.universal == true
+        run: |
+          cargo build --release --target x86_64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
+          lipo -create -output target/release/${{ matrix.artifact_name }} \
+            target/x86_64-apple-darwin/release/${{ matrix.artifact_name }} \
+            target/aarch64-apple-darwin/release/${{ matrix.artifact_name }}
+
+      - name: Package (Unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          if [ "${{ matrix.universal }}" == "true" ]; then
+            cd target/release
+            strip ${{ matrix.artifact_name }}
+            tar czf ../../${{ matrix.asset_name }} ${{ matrix.artifact_name }}
+          elif [ "${{ matrix.cross }}" == "true" ]; then
+            cd target/${{ matrix.target }}/release
+            tar czf ../../../${{ matrix.asset_name }} ${{ matrix.artifact_name }}
+          else
+            cd target/${{ matrix.target }}/release
+            strip ${{ matrix.artifact_name }}
+            tar czf ../../../${{ matrix.asset_name }} ${{ matrix.artifact_name }}
+          fi
+
+      - name: Package (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          cd target/${{ matrix.target }}/release
+          Compress-Archive -Path ${{ matrix.artifact_name }} -DestinationPath ../../../${{ matrix.asset_name }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}
+
+  create-release:
+    needs: build-release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate SHA256 checksums
+        run: |
+          cd artifacts
+          # Flatten artifacts (each artifact is in its own directory)
+          # Copy files to temp location first, then move to avoid directory name conflicts
+          mkdir -p ../temp_artifacts
+          find . -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec cp {} ../temp_artifacts/ \;
+          # Remove artifact directories and move files back
+          rm -rf */
+          mv ../temp_artifacts/* .
+          rmdir ../temp_artifacts
+          # Generate checksums
+          sha256sum *.tar.gz *.zip > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # Get the current tag
+          CURRENT_TAG=${GITHUB_REF#refs/tags/}
+
+          # Get the previous tag
+          PREVIOUS_TAG=$(git tag --sort=-version:refname | grep -A1 "^${CURRENT_TAG}$" | tail -n1)
+
+          echo "Current tag: $CURRENT_TAG"
+          echo "Previous tag: $PREVIOUS_TAG"
+
+          # Generate changelog header
+          echo "## What's Changed" > changelog.md
+          echo "" >> changelog.md
+
+          # Generate changelog from commits
+          if [ -z "$PREVIOUS_TAG" ] || [ "$PREVIOUS_TAG" = "$CURRENT_TAG" ]; then
+            echo "No previous tag found, using all commits"
+            git log --pretty=format:"- %s (%h)" --no-merges >> changelog.md
+          else
+            echo "Generating changelog from $PREVIOUS_TAG to $CURRENT_TAG"
+            git log ${PREVIOUS_TAG}..${CURRENT_TAG} --pretty=format:"- %s (%h)" --no-merges >> changelog.md
+          fi
+
+          echo "" >> changelog.md
+          echo "" >> changelog.md
+          echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREVIOUS_TAG}...${CURRENT_TAG}" >> changelog.md
+
+          cat changelog.md
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          prerelease: false
+          body_path: changelog.md
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+            artifacts/SHA256SUMS
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+
+  publish-npm-platforms:
+    name: Publish ${{ matrix.platform }} to NPM
+    needs: create-release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - platform: linux-x64
+            asset: bce-tool_Linux_x86_64.tar.gz
+            binary: bce-tool
+          - platform: linux-arm64
+            asset: bce-tool_Linux_aarch64.tar.gz
+            binary: bce-tool
+          - platform: darwin-universal
+            asset: bce-tool_Darwin_universal.tar.gz
+            binary: bce-tool
+          - platform: win32-x64
+            asset: bce-tool_Windows_x86_64.zip
+            binary: bce-tool.exe
+          - platform: win32-arm64
+            asset: bce-tool_Windows_aarch64.zip
+            binary: bce-tool.exe
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: .
+
+      - name: Extract and prepare package
+        run: |
+          cd npm/platforms/${{ matrix.platform }}
+          mkdir -p bin
+          # Extract binary to bin/
+          if [[ "${{ matrix.asset }}" == *.zip ]]; then
+            unzip ../../../${{ matrix.asset }} -d bin/
+          else
+            tar -xzf ../../../${{ matrix.asset }} -C bin/
+          fi
+          # Make binary executable (for Unix binaries)
+          if [[ "${{ matrix.binary }}" != *.exe ]]; then
+            chmod +x bin/${{ matrix.binary }}
+          fi
+          # Update version from tag
+          VERSION=${GITHUB_REF#refs/tags/v}
+          npm version $VERSION --no-git-tag-version --allow-same-version
+
+      - name: Publish to npm
+        run: |
+          cd npm/platforms/${{ matrix.platform }}
+          npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-npm:
+    name: Publish main package to NPM
+    needs: publish-npm-platforms
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Update version and publish
+        run: |
+          cd npm/bce-tool
+          VERSION=${GITHUB_REF#refs/tags/v}
+          npm version $VERSION --no-git-tag-version --allow-same-version
+          # Sync optionalDependencies versions
+          node -e "
+            const fs = require('fs');
+            const pkg = require('./package.json');
+            for (const dep in pkg.optionalDependencies) {
+              pkg.optionalDependencies[dep] = '$VERSION';
+            }
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+          npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -1,0 +1,8 @@
+.bce-tool/
+/target/
+.DS_Store
+.env
+.env.*
+
+# internal notes (kept local, not published)
+.aidoc/

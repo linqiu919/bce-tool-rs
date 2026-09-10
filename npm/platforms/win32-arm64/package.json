@@ -1,0 +1,17 @@
+{
+  "name": "@bce-tool/win32-arm64",
+  "version": "0.0.7",
+  "description": "Platform-specific binary for bce-tool (Windows ARM64)",
+  "license": "GPL-3.0-only OR LicenseRef-Commercial",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/linqiu919/bce-tool-rs.git"
+  },
+  "os": ["win32"],
+  "cpu": ["arm64"],
+  "files": ["bin/bce-tool.exe"],
+  "preferUnplugged": true,
+  "publishConfig": {
+    "access": "public"
+  }
+}
