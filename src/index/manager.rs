@@ -24,7 +24,10 @@ use crate::config::Config;
 use crate::http_logger::{self, HttpRequestLog, HttpResponseLog};
 use crate::strategy::{AdaptiveStrategy, ErrorType};
 use crate::utils::path_normalizer::{normalize_path, normalize_relative_path, RuntimeEnv};
-use crate::utils::project_detector::{get_index_file_path, is_inside_git_repo};
+use crate::utils::project_detector::{
+    get_index_file_path, is_inside_git_repo, is_unknown_field_rejection, note_legacy_server,
+    workspace_report, GitMeta,
+};
 use crate::USER_AGENT;
 
 /// Maximum blob size in bytes (128KB, aligned with official augment.mjs)
@@ -40,6 +43,11 @@ const MAX_INDEX_BYTES: u64 = 256 * 1024 * 1024;
 /// The backend rejects projects larger than this, so we skip uploading
 /// entirely and surface a clear notice to the AI model instead.
 pub const MAX_PROJECT_BYTES: u64 = 250 * 1024 * 1024;
+
+/// Below this many new blobs the missing-blob probe is skipped: a handful of
+/// edited files is new content by definition and the round trip would only
+/// add latency to the search that triggered the round.
+const MISSING_PROBE_MIN_BLOBS: usize = 16;
 
 /// AI-facing notice returned when the project's indexable content exceeds
 /// `MAX_PROJECT_BYTES`, so the model understands why the tool is unavailable
@@ -158,6 +166,12 @@ pub struct IndexStats {
 #[derive(Debug, Serialize)]
 struct BatchUploadRequest {
     blobs: Vec<Blob>,
+    /// BCE extension: workspace identity (see `workspace_report`) so the
+    /// console lists the project while its first upload is still running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git: Option<GitMeta>,
 }
 
 /// Batch upload response
@@ -184,10 +198,13 @@ struct SearchRequest {
     max_output_length: i32,
     disable_codebase_retrieval: bool,
     enable_commit_retrieval: bool,
-    /// BCE extension: project folder name, sent with every retrieval so the
-    /// server archives (and renames) the project under its real name.
+    /// BCE extension: project name and git block (branch + worktree flag),
+    /// sent with every retrieval so the server archives the project under
+    /// its real name and keeps sibling branches / worktrees apart.
     #[serde(skip_serializing_if = "Option::is_none")]
     project_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git: Option<GitMeta>,
 }
 
 #[derive(Debug, Serialize)]
@@ -212,14 +229,6 @@ fn calculate_config_hash(max_lines_per_blob: usize) -> String {
     hasher.update(b"v1:");
     hasher.update(max_lines_per_blob.to_le_bytes());
     hex::encode(&hasher.finalize()[..8])
-}
-
-fn project_folder_name(project_root: &Path) -> String {
-    project_root
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_default()
 }
 
 /// Index manager
@@ -824,14 +833,11 @@ impl IndexManager {
         }
 
         let url = format!("{}/batch-upload", base_url);
-        let request = BatchUploadRequest {
+        let ws = workspace_report(project_root);
+        let mut request = BatchUploadRequest {
             blobs: blobs.to_vec(),
-        };
-
-        let request_body = if http_logger::is_enabled() {
-            serde_json::to_string(&request).ok()
-        } else {
-            None
+            project_name: ws.project_name,
+            git: ws.git,
         };
 
         let mut last_error_type = None;
@@ -839,6 +845,11 @@ impl IndexManager {
         let max_retries = 3;
 
         for attempt in 0..max_retries {
+            let request_body = if http_logger::is_enabled() {
+                serde_json::to_string(&request).ok()
+            } else {
+                None
+            };
             let request_id = generate_request_id();
             let start_time = Instant::now();
 
@@ -853,7 +864,7 @@ impl IndexManager {
                         get_session_id(),
                         token,
                     ),
-                    body: request_body.clone(),
+                    body: request_body,
                 })
             } else {
                 None
@@ -916,6 +927,10 @@ impl IndexManager {
 
                     if status == 400 {
                         let text = response.text().await.unwrap_or_default();
+                        // A server older than the workspace fields rejects
+                        // them as unknown JSON: resend the same batch bare.
+                        let legacy = (request.git.is_some() || request.project_name.is_some())
+                            && is_unknown_field_rejection(400, &text);
                         if let Some(ref req_log) = http_request_log {
                             let response_log = HttpResponseLog {
                                 status: 400,
@@ -929,6 +944,13 @@ impl IndexManager {
                                 duration_ms,
                                 None,
                             );
+                        }
+                        if legacy && attempt < max_retries - 1 {
+                            warn!("Server predates workspace fields; retrying upload without them");
+                            note_legacy_server();
+                            request.project_name = None;
+                            request.git = None;
+                            continue;
                         }
                         return BatchUploadResult {
                             blob_names: Vec::new(),
@@ -1271,9 +1293,15 @@ impl IndexManager {
             new_blobs.len()
         );
 
-        // Step 5: Upload new blobs with adaptive strategy
+        // Step 5: Upload new blobs with adaptive strategy. A fresh clone or
+        // worktree of an already-indexed repository has no local cache, yet
+        // the server already holds nearly all of its content-addressed
+        // blobs: one probe per round skips those instead of re-sending them.
         let mut uploaded_blob_names: Vec<String> = Vec::new();
         let mut failed_batch_count: usize = 0;
+
+        let (new_blobs, present) = self.skip_present_blobs(new_blobs).await;
+        uploaded_blob_names.extend(present);
 
         if !new_blobs.is_empty() {
             let blobs_count = new_blobs.len();
@@ -1289,7 +1317,7 @@ impl IndexManager {
             );
 
             let (names, failed) = self.upload_blobs_adaptive(new_blobs, &mut strategy).await;
-            uploaded_blob_names = names;
+            uploaded_blob_names.extend(names);
             failed_batch_count = failed;
         } else {
             info!("No new files to upload, using cached index");
@@ -1380,6 +1408,96 @@ impl IndexManager {
         }
     }
 
+    /// Ask the server which of `blobs` it lacks and split them into
+    /// (to_upload, already_present_names). Small rounds skip the probe (see
+    /// MISSING_PROBE_MIN_BLOBS); any failure — network, or a server without
+    /// the endpoint — falls back to uploading everything.
+    async fn skip_present_blobs(&self, blobs: Vec<Blob>) -> (Vec<Blob>, Vec<String>) {
+        if blobs.len() < MISSING_PROBE_MIN_BLOBS {
+            return (blobs, Vec::new());
+        }
+        let names: Vec<String> = blobs
+            .iter()
+            .map(|b| Self::calculate_blob_name(&b.path, &b.content))
+            .collect();
+        let missing: HashSet<String> = match self.probe_missing(&names).await {
+            Ok(missing) => missing.into_iter().collect(),
+            Err(e) => {
+                info!(
+                    "Missing-blob probe unavailable ({}); uploading all {} blobs",
+                    e,
+                    blobs.len()
+                );
+                return (blobs, Vec::new());
+            }
+        };
+        let mut to_upload = Vec::new();
+        let mut present = Vec::new();
+        for (blob, name) in blobs.into_iter().zip(names) {
+            if missing.contains(&name) {
+                to_upload.push(blob);
+            } else {
+                present.push(name);
+            }
+        }
+        info!(
+            "Server already holds {} of {} new blobs; uploading {}",
+            present.len(),
+            present.len() + to_upload.len(),
+            to_upload.len()
+        );
+        (to_upload, present)
+    }
+
+    /// POST /blobs/missing: the subset of `names` the server does not hold.
+    async fn probe_missing(&self, names: &[String]) -> Result<Vec<String>> {
+        #[derive(Serialize)]
+        struct Probe<'a> {
+            blob_names: &'a [String],
+        }
+        #[derive(Deserialize)]
+        struct ProbeResponse {
+            missing: Vec<String>,
+        }
+        let url = format!("{}/blobs/missing", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .timeout(Duration::from_secs(20))
+            .header("Content-Type", "application/json")
+            .header("User-Agent", USER_AGENT)
+            .header("x-request-id", generate_request_id())
+            .header("x-request-session-id", get_session_id())
+            .header("Authorization", format!("Bearer {}", self.token))
+            .json(&Probe { blob_names: names })
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(anyhow!("HTTP {}", status));
+        }
+        Ok(response.json::<ProbeResponse>().await?.missing)
+    }
+
+    /// Retrieval request for the current workspace state.
+    fn search_request(&self, query: &str, blob_names: Vec<String>) -> SearchRequest {
+        let ws = workspace_report(&self.project_root);
+        SearchRequest {
+            information_request: query.to_string(),
+            blobs: BlobsPayload {
+                checkpoint_id: None,
+                added_blobs: blob_names,
+                deleted_blobs: Vec::new(),
+            },
+            dialog: Vec::new(),
+            max_output_length: 0,
+            disable_codebase_retrieval: false,
+            enable_commit_retrieval: false,
+            project_name: ws.project_name,
+            git: ws.git,
+        }
+    }
+
     /// Search code context
     pub async fn search_context(&self, query: &str) -> Result<String> {
         info!("Starting search: {}", query);
@@ -1407,129 +1525,131 @@ impl IndexManager {
         info!("Searching {} chunks...", blob_names.len());
 
         let url = format!("{}/agents/codebase-retrieval", self.base_url);
-        let request = SearchRequest {
-            information_request: query.to_string(),
-            blobs: BlobsPayload {
-                checkpoint_id: None,
-                added_blobs: blob_names,
-                deleted_blobs: Vec::new(),
-            },
-            dialog: Vec::new(),
-            max_output_length: 0,
-            disable_codebase_retrieval: false,
-            enable_commit_retrieval: false,
-            project_name: Some(project_folder_name(&self.project_root))
-                .filter(|name| !name.is_empty()),
-        };
+        let mut request = self.search_request(query, blob_names);
 
-        let request_id = generate_request_id();
-        let start_time = Instant::now();
+        // Two passes at most: the second only when the server rejected the
+        // workspace fields as unknown JSON (older build) — resend bare.
+        for attempt in 0..2 {
+            let request_id = generate_request_id();
+            let start_time = Instant::now();
 
-        // Lazy serialization: only serialize body if logging is enabled
-        let http_request_log = if http_logger::is_enabled() {
-            let request_body = serde_json::to_string(&request).ok();
-            Some(HttpRequestLog {
-                method: "POST".to_string(),
-                url: url.clone(),
-                headers: http_logger::extract_headers_from_builder(
-                    "application/json",
-                    USER_AGENT,
-                    &request_id,
-                    get_session_id(),
-                    &self.token,
-                ),
-                body: request_body,
-            })
-        } else {
-            None
-        };
+            // Lazy serialization: only serialize body if logging is enabled
+            let http_request_log = if http_logger::is_enabled() {
+                let request_body = serde_json::to_string(&request).ok();
+                Some(HttpRequestLog {
+                    method: "POST".to_string(),
+                    url: url.clone(),
+                    headers: http_logger::extract_headers_from_builder(
+                        "application/json",
+                        USER_AGENT,
+                        &request_id,
+                        get_session_id(),
+                        &self.token,
+                    ),
+                    body: request_body,
+                })
+            } else {
+                None
+            };
 
-        let response = self
-            .client
-            .post(&url)
-            .timeout(Duration::from_secs(self.retrieval_timeout_secs))
-            .header("Content-Type", "application/json")
-            .header("User-Agent", USER_AGENT)
-            .header("x-request-id", &request_id)
-            .header("x-request-session-id", get_session_id())
-            .header("Authorization", format!("Bearer {}", self.token))
-            .json(&request)
-            .send()
-            .await;
+            let response = self
+                .client
+                .post(&url)
+                .timeout(Duration::from_secs(self.retrieval_timeout_secs))
+                .header("Content-Type", "application/json")
+                .header("User-Agent", USER_AGENT)
+                .header("x-request-id", &request_id)
+                .header("x-request-session-id", get_session_id())
+                .header("Authorization", format!("Bearer {}", self.token))
+                .json(&request)
+                .send()
+                .await;
 
-        let duration_ms = start_time.elapsed().as_millis() as u64;
+            let duration_ms = start_time.elapsed().as_millis() as u64;
 
-        match response {
-            Ok(resp) => {
-                let status = resp.status();
-                let response_headers = if http_logger::is_enabled() {
-                    http_logger::extract_response_headers(&resp)
-                } else {
-                    Vec::new()
-                };
+            match response {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let response_headers = if http_logger::is_enabled() {
+                        http_logger::extract_response_headers(&resp)
+                    } else {
+                        Vec::new()
+                    };
 
-                if !status.is_success() {
-                    let text = resp.text().await.unwrap_or_default();
+                    if !status.is_success() {
+                        let text = resp.text().await.unwrap_or_default();
+                        if let Some(ref req_log) = http_request_log {
+                            let response_log = HttpResponseLog {
+                                status: status.as_u16(),
+                                headers: response_headers,
+                                body: Some(text.clone()),
+                            };
+                            http_logger::log_request(
+                                Some(&self.project_root),
+                                req_log,
+                                Some(&response_log),
+                                duration_ms,
+                                Some(&format!("Search failed: {} - {}", status, text)),
+                            );
+                        }
+                        if attempt == 0
+                            && (request.git.is_some() || request.project_name.is_some())
+                            && is_unknown_field_rejection(status.as_u16(), &text)
+                        {
+                            warn!("Server predates workspace fields; retrying search without them");
+                            note_legacy_server();
+                            request.project_name = None;
+                            request.git = None;
+                            continue;
+                        }
+                        return Err(anyhow!("Search failed: {} - {}", status, text));
+                    }
+
+                    let body_text = resp.text().await.unwrap_or_default();
                     if let Some(ref req_log) = http_request_log {
                         let response_log = HttpResponseLog {
                             status: status.as_u16(),
                             headers: response_headers,
-                            body: Some(text.clone()),
+                            body: Some(body_text.clone()),
                         };
                         http_logger::log_request(
                             Some(&self.project_root),
                             req_log,
                             Some(&response_log),
                             duration_ms,
-                            Some(&format!("Search failed: {} - {}", status, text)),
+                            None,
                         );
                     }
-                    return Err(anyhow!("Search failed: {} - {}", status, text));
-                }
 
-                let body_text = resp.text().await.unwrap_or_default();
-                if let Some(ref req_log) = http_request_log {
-                    let response_log = HttpResponseLog {
-                        status: status.as_u16(),
-                        headers: response_headers,
-                        body: Some(body_text.clone()),
+                    let search_response: SearchResponse = serde_json::from_str(&body_text)?;
+
+                    return match search_response.formatted_retrieval {
+                        Some(result) if !result.is_empty() => {
+                            info!("Search complete");
+                            Ok(result)
+                        }
+                        _ => {
+                            info!("No relevant code found");
+                            Ok("No relevant code context found for your query.".to_string())
+                        }
                     };
-                    http_logger::log_request(
-                        Some(&self.project_root),
-                        req_log,
-                        Some(&response_log),
-                        duration_ms,
-                        None,
-                    );
                 }
-
-                let search_response: SearchResponse = serde_json::from_str(&body_text)?;
-
-                match search_response.formatted_retrieval {
-                    Some(result) if !result.is_empty() => {
-                        info!("Search complete");
-                        Ok(result)
+                Err(e) => {
+                    let error_msg = e.to_string();
+                    if let Some(ref req_log) = http_request_log {
+                        http_logger::log_request(
+                            Some(&self.project_root),
+                            req_log,
+                            None,
+                            duration_ms,
+                            Some(&error_msg),
+                        );
                     }
-                    _ => {
-                        info!("No relevant code found");
-                        Ok("No relevant code context found for your query.".to_string())
-                    }
+                    return Err(anyhow!("Search request failed: {}", error_msg));
                 }
-            }
-            Err(e) => {
-                let error_msg = e.to_string();
-                if let Some(ref req_log) = http_request_log {
-                    http_logger::log_request(
-                        Some(&self.project_root),
-                        req_log,
-                        None,
-                        duration_ms,
-                        Some(&error_msg),
-                    );
-                }
-                Err(anyhow!("Search request failed: {}", error_msg))
             }
         }
+        Err(anyhow!("Search failed: retries exhausted"))
     }
 }
 

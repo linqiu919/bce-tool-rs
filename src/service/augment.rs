@@ -1,5 +1,6 @@
 //! Augment API service - New and Old endpoints
 
+use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{anyhow, Result};
@@ -9,6 +10,9 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::http_logger::{self, HttpRequestLog, HttpResponseLog};
+use crate::utils::project_detector::{
+    is_unknown_field_rejection, note_legacy_server, workspace_report, GitMeta,
+};
 use crate::USER_AGENT;
 
 use super::common::{
@@ -48,6 +52,12 @@ struct PromptEnhancerRequestNew {
     conversation_id: Option<String>,
     model: String,
     mode: String,
+    /// BCE extension: which archived project supplies the codebase context
+    /// (the enhancing workspace, not whichever one searched last).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git: Option<GitMeta>,
 }
 
 /// Request payload for OLD chat-stream endpoint (full request with blobs)
@@ -119,10 +129,12 @@ pub async fn call_new_endpoint(
     config: &Config,
     original_prompt: &str,
     conversation_history: &str,
+    project_root: Option<&Path>,
 ) -> Result<String> {
     let chat_history = parse_chat_history(conversation_history);
+    let ws = project_root.map(workspace_report).unwrap_or_default();
 
-    let payload = PromptEnhancerRequestNew {
+    let mut payload = PromptEnhancerRequestNew {
         nodes: vec![PromptNode {
             id: NODE_ID_NEW,
             node_type: 0,
@@ -134,70 +146,87 @@ pub async fn call_new_endpoint(
         conversation_id: None,
         model: DEFAULT_MODEL.to_string(),
         mode: "CHAT".to_string(),
+        project_name: ws.project_name,
+        git: ws.git,
     };
 
     let url = format!("{}/prompt-enhancer", config.base_url);
-    let request_id = generate_request_id();
-    let start_time = Instant::now();
 
-    let http_request_log = if http_logger::is_enabled() {
-        let request_body = serde_json::to_string(&payload).ok();
-        Some(HttpRequestLog {
-            method: "POST".to_string(),
-            url: url.clone(),
-            headers: http_logger::extract_headers_from_builder(
-                "application/json",
-                USER_AGENT,
-                &request_id,
-                get_session_id(),
-                REDACTED_TOKEN,
-            ),
-            body: request_body,
-        })
-    } else {
-        None
-    };
+    // Two passes at most: the second only when the server rejected the
+    // workspace fields as unknown JSON (older build) — resend bare.
+    for attempt in 0..2 {
+        let request_id = generate_request_id();
+        let start_time = Instant::now();
 
-    let response = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("User-Agent", USER_AGENT)
-        .header("x-request-id", &request_id)
-        .header("x-request-session-id", get_session_id())
-        .header("Authorization", format!("Bearer {}", config.token))
-        .json(&payload)
-        .send()
-        .await;
+        let http_request_log = if http_logger::is_enabled() {
+            let request_body = serde_json::to_string(&payload).ok();
+            Some(HttpRequestLog {
+                method: "POST".to_string(),
+                url: url.clone(),
+                headers: http_logger::extract_headers_from_builder(
+                    "application/json",
+                    USER_AGENT,
+                    &request_id,
+                    get_session_id(),
+                    REDACTED_TOKEN,
+                ),
+                body: request_body,
+            })
+        } else {
+            None
+        };
 
-    let duration_ms = start_time.elapsed().as_millis() as u64;
+        let response = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("User-Agent", USER_AGENT)
+            .header("x-request-id", &request_id)
+            .header("x-request-session-id", get_session_id())
+            .header("Authorization", format!("Bearer {}", config.token))
+            .json(&payload)
+            .send()
+            .await;
 
-    match response {
-        Ok(resp) => {
-            let status = resp.status();
-            let response_headers = if http_logger::is_enabled() {
-                http_logger::extract_response_headers(&resp)
-            } else {
-                Vec::new()
-            };
-            let body_text = resp.text().await.unwrap_or_default();
-            if let Some(ref req_log) = http_request_log {
-                let response_log = HttpResponseLog {
-                    status: status.as_u16(),
-                    headers: response_headers,
-                    body: Some(body_text.clone()),
+        let duration_ms = start_time.elapsed().as_millis() as u64;
+
+        match response {
+            Ok(resp) => {
+                let status = resp.status();
+                let response_headers = if http_logger::is_enabled() {
+                    http_logger::extract_response_headers(&resp)
+                } else {
+                    Vec::new()
                 };
-                http_logger::log_request(None, req_log, Some(&response_log), duration_ms, None);
+                let body_text = resp.text().await.unwrap_or_default();
+                if let Some(ref req_log) = http_request_log {
+                    let response_log = HttpResponseLog {
+                        status: status.as_u16(),
+                        headers: response_headers,
+                        body: Some(body_text.clone()),
+                    };
+                    http_logger::log_request(None, req_log, Some(&response_log), duration_ms, None);
+                }
+                if attempt == 0
+                    && (payload.git.is_some() || payload.project_name.is_some())
+                    && is_unknown_field_rejection(status.as_u16(), &body_text)
+                {
+                    note_legacy_server();
+                    payload.project_name = None;
+                    payload.git = None;
+                    continue;
+                }
+                return handle_response_text(status.as_u16(), &body_text, false);
             }
-            handle_response_text(status.as_u16(), &body_text, false)
-        }
-        Err(e) => {
-            let error_msg = e.to_string();
-            if let Some(ref req_log) = http_request_log {
-                http_logger::log_request(None, req_log, None, duration_ms, Some(&error_msg));
+            Err(e) => {
+                let error_msg = e.to_string();
+                if let Some(ref req_log) = http_request_log {
+                    http_logger::log_request(None, req_log, None, duration_ms, Some(&error_msg));
+                }
+                return Err(anyhow!("Request failed: {}", error_msg));
             }
-            Err(anyhow!("Request failed: {}", error_msg))
         }
     }
+    Err(anyhow!("Request failed: retries exhausted"))
 }
 
 /// Call OLD /chat-stream endpoint (full request with blobs)

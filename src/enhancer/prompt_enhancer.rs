@@ -429,7 +429,14 @@ async fn call_prompt_enhancer_api_static(
     match endpoint {
         EnhancerEndpoint::New => {
             info!("Using NEW prompt-enhancer endpoint");
-            call_new_endpoint(client, config, original_prompt, conversation_history).await
+            call_new_endpoint(
+                client,
+                config,
+                original_prompt,
+                conversation_history,
+                project_root,
+            )
+            .await
         }
         EnhancerEndpoint::Old => {
             info!("Using OLD chat-stream endpoint");
